@@ -1,15 +1,15 @@
 import requests
 
-BRIDGE_URL = "http://127.0.0.1:8000/request_access"
+BRIDGE_URL = "https://nexus-protocol.onrender.com/request_access"
 SELLER_URL = "http://127.0.0.1:8001/get_data"
 
 # The agent's secret master key
-MY_API_KEY = "NEXUS_CLIENT_SECRET_123"
+API_KEY = "NEXUS_CLIENT_SECRET_123"
 
 
 def run_transaction():
     print("--- 1. NEXUS: Paying for access ---")
-    headers = {"x-api-key": MY_API_KEY}
+    headers = {"x-api-key": API_KEY}
 
     resp = requests.post(BRIDGE_URL, headers=headers)
 
