@@ -1,13 +1,17 @@
 import hashlib
 import uuid
 from fastapi import FastAPI, HTTPException, Header
+from pydantic import BaseModel
 from nexus_db import supabase
 
 app = FastAPI(title="Nexus Protocol Bridge")
 
-# CONSTANTS
+
+class BuyRequest(BaseModel):
+    seller_id: str
+
+
 COST = 10
-SELLER_ID = "seller_01"  # The ID of the agent providing the data
 
 
 @app.get("/")
@@ -16,7 +20,7 @@ def health_check():
 
 
 @app.post("/request_access")
-def request_access(x_api_key: str = Header(None)):
+def request_access(request: BuyRequest, x_api_key: str = Header(None)):
     if not x_api_key:
         raise HTTPException(status_code=400, detail="Missing API Key header")
 
@@ -28,12 +32,11 @@ def request_access(x_api_key: str = Header(None)):
 
     user = user_resp.data[0]
     u_id = user['user_id']
-    current_balance = user['balance']
 
+    current_balance = user['balance']
     if current_balance < COST:
         raise HTTPException(status_code=402, detail="Insufficient Balance")
 
-    # Step 1: Lock funds in Escrow
     new_balance = current_balance - COST
     new_escrow = (user.get('escrow_balance') or 0) + COST
 
@@ -42,27 +45,28 @@ def request_access(x_api_key: str = Header(None)):
         "escrow_balance": new_escrow
     }).eq("user_id", u_id).execute()
 
-    # Step 2: Create Token
     new_token = str(uuid.uuid4())
     supabase.table("tokens").insert({
         "token": new_token,
-        "user_id": u_id
+        "user_id": u_id,
+        "seller_id": request.seller_id
     }).execute()
 
-    print(f"BRIDGE: Locked {COST} credits from {u_id}")
+    print(f"BRIDGE: Locked {COST} from {u_id} for {request.seller_id}", flush=True)
     return {"auth_token": new_token}
 
 
 @app.get("/verify/{token}")
 def verify_token(token: str):
-    # 1. Find the token
     token_resp = supabase.table("tokens").select("*").eq("token", token).execute()
     if not token_resp.data:
         return {"valid": False}
 
-    buyer_id = token_resp.data[0]['user_id']
+    token_data = token_resp.data[0]
+    buyer_id = token_data['user_id']
+    seller_id = token_data['seller_id']
 
-    # 2. THE PAYOUT LOGIC
+    # 1. PAYOUT LOGIC
     # A. Deduct from Buyer's Escrow
     buyer_resp = supabase.table("users").select("escrow_balance").eq("user_id", buyer_id).execute()
     if buyer_resp.data:
@@ -72,15 +76,23 @@ def verify_token(token: str):
         }).eq("user_id", buyer_id).execute()
 
     # B. Add to Seller's Total Earned
-    seller_resp = supabase.table("users").select("total_earned").eq("user_id", SELLER_ID).execute()
+    seller_resp = supabase.table("users").select("total_earned").eq("user_id", seller_id).execute()
     if seller_resp.data:
         current_earned = seller_resp.data[0].get('total_earned') or 0
         supabase.table("users").update({
             "total_earned": current_earned + COST
-        }).eq("user_id", SELLER_ID).execute()
+        }).eq("user_id", seller_id).execute()
+
+    # 2. NEW: RECORD THE TRANSACTION IN THE LEDGER
+    supabase.table("transactions").insert({
+        "buyer_id": buyer_id,
+        "seller_id": seller_id,
+        "amount": COST,
+        "token": token
+    }).execute()
 
     # 3. Burn the token
     supabase.table("tokens").delete().eq("token", token).execute()
 
-    print(f"BRIDGE: Payment complete! {COST} moved from {buyer_id} escrow to {SELLER_ID} earnings.")
+    print(f"BRIDGE: Payment complete & Ledger updated for {seller_id}", flush=True)
     return {"valid": True, "buyer_id": buyer_id}

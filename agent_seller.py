@@ -13,7 +13,7 @@ def get_data(x_nexus_token: str = Header(None)):
         raise HTTPException(status_code=401, detail="Missing Nexus Token")
 
     # 1. VERIFICATION: Ask the Bridge if this token is real
-    print(f"SELLER: Verifying token {x_nexus_token[:8]}...")
+    print(f"SELLER: Verifying token {x_nexus_token[:8]}...", flush=True)
 
     try:
         # The bridge endpoint is /verify/{token}
@@ -26,7 +26,7 @@ def get_data(x_nexus_token: str = Header(None)):
         verification = verify_resp.json()
 
         if verification.get("valid"):
-            print(f"✅ SELLER: Token valid! Providing data to {verification.get('buyer_id')}")
+            print(f"✅ SELLER: Token valid! Providing data to {verification.get('buyer_id')}", flush=True)
             return {
                 "status": "success",
                 "data": "This is the secret protocol data from the Seller Agent.",
