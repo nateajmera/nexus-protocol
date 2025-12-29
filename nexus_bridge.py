@@ -1,54 +1,86 @@
 import hashlib
-import secrets
+import uuid
 from fastapi import FastAPI, HTTPException, Header
-import nexus_db
+from nexus_db import supabase
 
 app = FastAPI(title="Nexus Protocol Bridge")
+
+# CONSTANTS
+COST = 10
+SELLER_ID = "seller_01"  # The ID of the agent providing the data
+
 
 @app.get("/")
 def health_check():
     return {"status": "online", "message": "Nexus Bridge is active"}
 
+
 @app.post("/request_access")
 def request_access(x_api_key: str = Header(None)):
     if not x_api_key:
-        raise HTTPException(status_code=401, detail="API Key Missing")
+        raise HTTPException(status_code=400, detail="Missing API Key header")
 
-    # 1. HASH THE KEY: Turn "NEXUS_CLIENT_SECRET_123" into the 64-char fingerprint
     hashed_key = hashlib.sha256(x_api_key.encode()).hexdigest()
+    user_resp = supabase.table("users").select("*").eq("api_key_hash", hashed_key).execute()
 
-    # 2. DATABASE LOOKUP: Pass the hash to the DB
-    user_data = nexus_db.get_user_by_key(hashed_key)
+    if not user_resp.data:
+        raise HTTPException(status_code=401, detail="Invalid API Key")
 
-    if not user_data:
-        # This will show up in your Render logs for debugging
-        print(f"SECURITY: No match found for hash: {hashed_key}")
-        raise HTTPException(status_code=403, detail="Invalid API Key")
+    user = user_resp.data[0]
+    u_id = user['user_id']
+    current_balance = user['balance']
 
-    user_id, balance = user_data
-    cost = 10
+    if current_balance < COST:
+        raise HTTPException(status_code=402, detail="Insufficient Balance")
 
-    # 3. PAYMENT LOGIC
-    if balance >= cost:
-        new_balance = balance - cost
-        nexus_db.update_balance(user_id, new_balance)
+    # Step 1: Lock funds in Escrow
+    new_balance = current_balance - COST
+    new_escrow = (user.get('escrow_balance') or 0) + COST
 
-        # 4. TOKEN GENERATION
-        new_token = secrets.token_hex(16)
-        nexus_db.save_token(new_token, user_id)
+    supabase.table("users").update({
+        "balance": new_balance,
+        "escrow_balance": new_escrow
+    }).eq("user_id", u_id).execute()
 
-        print(f"SUCCESS: {user_id} paid {cost}. Remaining: {new_balance}")
-        return {
-            "status": "APPROVED",
-            "new_balance": new_balance,
-            "auth_token": new_token
-        }
+    # Step 2: Create Token
+    new_token = str(uuid.uuid4())
+    supabase.table("tokens").insert({
+        "token": new_token,
+        "user_id": u_id
+    }).execute()
 
-    raise HTTPException(status_code=402, detail="Insufficient Nexus Credits")
+    print(f"BRIDGE: Locked {COST} credits from {u_id}")
+    return {"auth_token": new_token}
+
 
 @app.get("/verify/{token}")
 def verify_token(token: str):
-    buyer_id = nexus_db.verify_and_burn_token(token)
-    if buyer_id:
-        return {"valid": True, "buyer_id": buyer_id}
-    return {"valid": False}
+    # 1. Find the token
+    token_resp = supabase.table("tokens").select("*").eq("token", token).execute()
+    if not token_resp.data:
+        return {"valid": False}
+
+    buyer_id = token_resp.data[0]['user_id']
+
+    # 2. THE PAYOUT LOGIC
+    # A. Deduct from Buyer's Escrow
+    buyer_resp = supabase.table("users").select("escrow_balance").eq("user_id", buyer_id).execute()
+    if buyer_resp.data:
+        current_escrow = buyer_resp.data[0].get('escrow_balance') or 0
+        supabase.table("users").update({
+            "escrow_balance": max(0, current_escrow - COST)
+        }).eq("user_id", buyer_id).execute()
+
+    # B. Add to Seller's Total Earned
+    seller_resp = supabase.table("users").select("total_earned").eq("user_id", SELLER_ID).execute()
+    if seller_resp.data:
+        current_earned = seller_resp.data[0].get('total_earned') or 0
+        supabase.table("users").update({
+            "total_earned": current_earned + COST
+        }).eq("user_id", SELLER_ID).execute()
+
+    # 3. Burn the token
+    supabase.table("tokens").delete().eq("token", token).execute()
+
+    print(f"BRIDGE: Payment complete! {COST} moved from {buyer_id} escrow to {SELLER_ID} earnings.")
+    return {"valid": True, "buyer_id": buyer_id}

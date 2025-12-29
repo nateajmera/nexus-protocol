@@ -1,37 +1,47 @@
-import requests
 from fastapi import FastAPI, Header, HTTPException
+import requests
 
-app = FastAPI(title="Seller Agent (The Store)")
+app = FastAPI(title="Nexus Seller Agent")
 
-# The location of the Bridge's verification line
-BRIDGE_VERIFY_URL = "http://127.0.0.1:8000/verify/"
-
-# The secret data the AI is selling
-VALUABLE_DATA = "The secret ingredient is... 42."
+# FIXED: Point to your local Bridge instead of Render
+BRIDGE_URL = "http://127.0.0.1:8000/verify"
 
 
 @app.get("/get_data")
 def get_data(x_nexus_token: str = Header(None)):
-    """Seller holds the request and calls the Bridge for confirmation"""
     if not x_nexus_token:
-        raise HTTPException(status_code=401, detail="Token Missing")
+        raise HTTPException(status_code=401, detail="Missing Nexus Token")
 
-    print(f"STORE: Verifying token {x_nexus_token} with Nexus Bridge...")
+    # 1. VERIFICATION: Ask the Bridge if this token is real
+    print(f"SELLER: Verifying token {x_nexus_token[:8]}...")
 
-    # CALL THE BRIDGE (The Check-Back)
     try:
-        response = requests.get(f"{BRIDGE_VERIFY_URL}{x_nexus_token}")
-        verification = response.json()
-    except Exception:
-        raise HTTPException(status_code=503, detail="Nexus Bridge is offline.")
+        # The bridge endpoint is /verify/{token}
+        verify_resp = requests.get(f"{BRIDGE_URL}/{x_nexus_token}")
 
-    if verification.get("valid"):
-        print(f"STORE: Token valid! Releasing data to {verification['buyer_id']}")
-        return {
-            "success": True,
-            "data": VALUABLE_DATA,
-            "verified_for": verification["buyer_id"]
-        }
-    else:
-        print("STORE: Token REJECTED by Bridge.")
-        raise HTTPException(status_code=403, detail="Invalid or Expired Nexus Token")
+        if verify_resp.status_code != 200:
+            print(f"SELLER ERROR: Bridge returned {verify_resp.status_code}")
+            raise HTTPException(status_code=403, detail="Bridge verification failed")
+
+        verification = verify_resp.json()
+
+        if verification.get("valid"):
+            print(f"✅ SELLER: Token valid! Providing data to {verification.get('buyer_id')}")
+            return {
+                "status": "success",
+                "data": "This is the secret protocol data from the Seller Agent.",
+                "buyer_id": verification.get("buyer_id")
+            }
+        else:
+            print("❌ SELLER: Token invalid or already used.")
+            raise HTTPException(status_code=403, detail="Invalid Token")
+
+    except Exception as e:
+        print(f"SELLER CRASH: {e}")
+        raise HTTPException(status_code=500, detail="Internal Seller Error")
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="127.0.0.1", port=8001)
