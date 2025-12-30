@@ -1,4 +1,4 @@
-# nexus_bridge.py (FULL REPLACEMENT)
+# nexus_bridge.py (FULL REPLACEMENT - VERSION STAMP)
 
 import hashlib
 import uuid
@@ -8,12 +8,12 @@ from nexus_db import supabase
 
 app = FastAPI(title="Nexus Protocol Bridge")
 
+COST = 10
+BRIDGE_VERSION = "rep_v1_debug_001"  # <-- MUST show up in logs
+
 
 class BuyRequest(BaseModel):
     seller_id: str
-
-
-COST = 10
 
 
 def _require(value: str | None, header_name: str) -> str:
@@ -32,16 +32,13 @@ def _auth_user_id(api_key: str) -> str:
 
 @app.get("/")
 def health_check():
-    return {"status": "online", "message": "Nexus Bridge is active"}
+    return {"status": "online", "message": "Nexus Bridge is active", "version": BRIDGE_VERSION}
 
 
 @app.post("/request_access")
 def request_access(request: BuyRequest, x_api_key: str = Header(None)):
-    # 1) Authenticate buyer
-    buyer_api_key = _require(x_api_key, "x-api-key")
-    buyer_id = _auth_user_id(buyer_api_key)
+    buyer_id = _auth_user_id(_require(x_api_key, "x-api-key"))
 
-    # 2) Load buyer balances
     buyer_resp = supabase.table("users").select("balance, escrow_balance").eq("user_id", buyer_id).execute()
     if not buyer_resp.data:
         raise HTTPException(status_code=401, detail="Invalid Buyer")
@@ -53,13 +50,11 @@ def request_access(request: BuyRequest, x_api_key: str = Header(None)):
     if balance < COST:
         raise HTTPException(status_code=402, detail="Insufficient Balance")
 
-    # 3) Lock funds into escrow
     supabase.table("users").update({
         "balance": balance - COST,
         "escrow_balance": escrow + COST
     }).eq("user_id", buyer_id).execute()
 
-    # 4) Mint token tied to buyer + intended seller
     token = str(uuid.uuid4())
     supabase.table("tokens").insert({
         "token": token,
@@ -67,22 +62,14 @@ def request_access(request: BuyRequest, x_api_key: str = Header(None)):
         "seller_id": request.seller_id
     }).execute()
 
-    print(f"BRIDGE: Locked {COST} from {buyer_id} for {request.seller_id}", flush=True)
+    print(f"[{BRIDGE_VERSION}] BRIDGE: Locked {COST} from {buyer_id} for {request.seller_id}", flush=True)
     return {"auth_token": token}
 
 
 @app.get("/verify/{token}")
 def verify_token(token: str, x_seller_api_key: str = Header(None)):
-    """
-    Seller-authenticated redemption.
-    Burn token FIRST (safer).
-    Record token in transactions ledger.
-    """
-    # 1) Authenticate seller
-    seller_api_key = _require(x_seller_api_key, "x-seller-api-key")
-    seller_auth_id = _auth_user_id(seller_api_key)
+    seller_id = _auth_user_id(_require(x_seller_api_key, "x-seller-api-key"))
 
-    # 2) Load token row
     token_resp = supabase.table("tokens").select("token, user_id, seller_id").eq("token", token).execute()
     if not token_resp.data:
         return {"valid": False}
@@ -91,33 +78,43 @@ def verify_token(token: str, x_seller_api_key: str = Header(None)):
     buyer_id = row["user_id"]
     intended_seller_id = row["seller_id"]
 
-    # 3) Enforce intended seller
-    if seller_auth_id != intended_seller_id:
+    if seller_id != intended_seller_id:
         raise HTTPException(status_code=403, detail="Seller not authorized for this token")
 
-    # 4) Burn token FIRST (prevents easy double redemption)
+    # Burn token first
     delete_resp = supabase.table("tokens").delete().eq("token", token).execute()
     if delete_resp.data is not None and len(delete_resp.data) == 0:
-        # Already deleted by another redemption
         return {"valid": False}
 
-    # 5) Deduct from buyer escrow
+    # Deduct buyer escrow
     buyer_escrow_resp = supabase.table("users").select("escrow_balance").eq("user_id", buyer_id).execute()
     buyer_escrow = (buyer_escrow_resp.data[0].get("escrow_balance") or 0) if buyer_escrow_resp.data else 0
-
     supabase.table("users").update({
         "escrow_balance": max(0, buyer_escrow - COST)
     }).eq("user_id", buyer_id).execute()
 
-    # 6) Add to seller total_earned
-    seller_resp = supabase.table("users").select("total_earned").eq("user_id", intended_seller_id).execute()
-    seller_earned = (seller_resp.data[0].get("total_earned") or 0) if seller_resp.data else 0
+    # Read seller earned + rep
+    seller_resp = supabase.table("users").select("total_earned, reputation").eq("user_id", intended_seller_id).execute()
+    if not seller_resp.data:
+        raise HTTPException(status_code=500, detail="Seller not found in users table")
 
-    supabase.table("users").update({
-        "total_earned": seller_earned + COST
+    seller = seller_resp.data[0]
+    earned = seller.get("total_earned") or 0
+    rep = seller.get("reputation")
+    if rep is None:
+        print(f"[{BRIDGE_VERSION}] WARNING: seller reputation is NULL; treating as 0", flush=True)
+        rep = 0
+
+    upd_resp = supabase.table("users").update({
+        "total_earned": earned + COST,
+        "reputation": rep + 1
     }).eq("user_id", intended_seller_id).execute()
 
-    # 7) Record transaction (includes token)
+    print(f"[{BRIDGE_VERSION}] DEBUG: users.update = {upd_resp.data}", flush=True)
+
+    seller_check = supabase.table("users").select("reputation, total_earned").eq("user_id", intended_seller_id).execute()
+    print(f"[{BRIDGE_VERSION}] DEBUG: seller after update = {seller_check.data}", flush=True)
+
     supabase.table("transactions").insert({
         "buyer_id": buyer_id,
         "seller_id": intended_seller_id,
@@ -125,5 +122,5 @@ def verify_token(token: str, x_seller_api_key: str = Header(None)):
         "token": token
     }).execute()
 
-    print(f"BRIDGE: Verified & settled token for seller {intended_seller_id}", flush=True)
+    print(f"[{BRIDGE_VERSION}] BRIDGE: Verified & settled token for seller {intended_seller_id} (rep +1 expected)", flush=True)
     return {"valid": True, "buyer_id": buyer_id}
