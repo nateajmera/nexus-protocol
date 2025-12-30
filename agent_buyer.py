@@ -1,7 +1,7 @@
 import requests
 
 # SETTINGS
-BRIDGE_URL = "http://127.0.0.1:8000/request_access"
+BRIDGE_URL = "https://nexus-protocol.onrender.com/request_access"
 SELLER_URL = "http://127.0.0.1:8001/get_data"
 API_KEY = "TEST_KEY_1"
 

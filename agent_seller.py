@@ -3,8 +3,7 @@ import requests
 
 app = FastAPI(title="Nexus Seller Agent")
 
-# FIXED: Point to your local Bridge instead of Render
-BRIDGE_URL = "http://127.0.0.1:8000/verify"
+BRIDGE_URL = "https://nexus-protocol.onrender.com/verify"
 
 
 @app.get("/get_data")

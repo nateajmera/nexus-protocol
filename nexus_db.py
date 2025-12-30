@@ -3,29 +3,19 @@ from pathlib import Path
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
-# 1. Force Python to find the .env file in the same folder as this script
-env_path = Path(__file__).parent / '.env'
-load_dotenv(dotenv_path=env_path)
+# Load local .env only if it exists (dev machine). On Render, env vars come from Render UI.
+env_path = Path(__file__).parent / ".env"
+if env_path.exists():
+    load_dotenv(dotenv_path=env_path)
 
-# 2. Load variables
-# We use the NAMES of the variables as defined in your .env file
 url = os.environ.get("SUPABASE_URL")
 key = os.environ.get("SUPABASE_KEY")
 
-# 3. Debugging Print (This will show up in your terminal so you know it worked)
-# We print only the first 5 characters to verify it loaded without revealing the secret
-if url and key:
-    print(f"✅ SUCCESS: Loaded Supabase URL: {url[:8]}...")
-    print(f"✅ SUCCESS: Loaded Key starting with: {key[:5]}...")
-else:
-    print("❌ ERROR: Still could not find SUPABASE_URL or SUPABASE_KEY in .env")
-    print(f"Looking for .env at: {env_path}")
-
-# 4. Initialize Client
 if not url or not key:
-    raise ValueError("Supabase credentials missing. Check .env file.")
+    raise ValueError("Supabase credentials missing. Set SUPABASE_URL and SUPABASE_KEY.")
 
 supabase: Client = create_client(url, key)
+
 
 # ... (keep your existing functions below this line) ...
 def get_user_by_key(key_hash):
