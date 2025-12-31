@@ -1,26 +1,30 @@
 # agent_buyer.py (FULL REPLACEMENT)
 
+import uuid
 import requests
 
 BRIDGE_URL = "https://nexus-protocol.onrender.com/request_access"
 SELLER_URL = "http://127.0.0.1:8001/get_data"
 
-# Buyer API key (must match users.api_key_hash for agent_buyer_01)
 API_KEY = "TEST_KEY_1"
-
-# Must match users.user_id for the seller row in Supabase
 TARGET_SELLER = "seller_01"
 
 
 def run_transaction():
-    print(f"--- 1. NEXUS: Requesting access to {TARGET_SELLER} ---")
+    # New idempotency key per purchase attempt (prevents double-lock on retries)
+    idem = str(uuid.uuid4())
 
-    headers = {"x-api-key": API_KEY}
+    print(f"--- 1. NEXUS: Requesting access to {TARGET_SELLER} ---")
+    print(f"---    Idempotency Key: {idem} ---")
+
+    headers = {
+        "x-api-key": API_KEY,
+        "x-idempotency-key": idem
+    }
     payload = {"seller_id": TARGET_SELLER}
 
     try:
         resp = requests.post(BRIDGE_URL, headers=headers, json=payload, timeout=10)
-
         if resp.status_code != 200:
             print(f"--- FAILED: Bridge returned {resp.status_code} - {resp.text} ---")
             return
