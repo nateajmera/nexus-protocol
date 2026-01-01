@@ -105,8 +105,10 @@ def verify_token(token: str, x_seller_api_key: str = Header(None)):
         raise HTTPException(status_code=500, detail=f"Unexpected RPC response: {result}")
 
     if not result.get("valid"):
-        # token may have expired and been refunded or already used
-        return {"valid": False, "error": result.get("error")}
+        return {
+            "valid": False,
+            "error": result.get("error")
+        }
 
     print(f"[{BRIDGE_VERSION}] Settled token for seller {seller_id} (atomic)", flush=True)
     return {"valid": True, "buyer_id": result.get("buyer_id"), "already_settled": result.get("already_settled", False)}
@@ -114,16 +116,16 @@ def verify_token(token: str, x_seller_api_key: str = Header(None)):
 
 @app.post("/sweep_expired")
 def sweep_expired(x_admin_key: str = Header(None)):
-    """
-    Admin-triggered sweep. Later you can cron this.
-    Refunds expired tokens: escrow -> balance, burns token.
-    """
     _require_admin(x_admin_key)
 
     try:
         rpc_resp = supabase.rpc(
             "nexus_sweep_expired_tokens",
-            {"p_limit": SWEEP_LIMIT, "p_cost": COST},
+            {
+                "p_limit": SWEEP_LIMIT,
+                "p_cost": COST,
+                "p_triggered_by": "admin"
+            },
         ).execute()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"RPC failure: {e}")
