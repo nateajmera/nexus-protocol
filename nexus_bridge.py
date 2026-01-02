@@ -4,13 +4,12 @@ from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from nexus_db import supabase
-
-# This import is important so we can detect Supabase/PostgREST errors cleanly.
 from postgrest.exceptions import APIError
 
 app = FastAPI(title="Nexus Protocol Bridge")
 
 COST = 10
+TOKEN_TTL_SECONDS = 600  # 10 minutes
 
 SELLER_KEY_MAP = {
     "SELLER_KEY_1": "seller_01",
@@ -22,11 +21,6 @@ class BuyRequest(BaseModel):
 
 
 def _raise_clean_apierror(e: APIError):
-    """
-    Convert Supabase/PostgREST APIError into a readable HTTP response.
-    This is safe: it doesn't expose your keys, just the DB/RPC error message.
-    """
-    # e.args[0] is often a dict like {"message": "...", "code": "...", ...}
     payload = None
     try:
         if e.args and isinstance(e.args[0], dict):
@@ -46,41 +40,22 @@ def _raise_clean_apierror(e: APIError):
             },
         )
     else:
-        raise HTTPException(
-            status_code=500,
-            detail={"supabase_error": True, "message": str(e)},
-        )
+        raise HTTPException(status_code=500, detail={"supabase_error": True, "message": str(e)})
 
 
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):
-    # Print full stack trace to Render logs
     print("🔥 UNHANDLED EXCEPTION:", repr(exc), flush=True)
     traceback.print_exc()
 
-    # If it's Supabase/PostgREST, return a readable error to the client too
     if isinstance(exc, APIError):
-        # We intentionally return the message so you can debug fast
         try:
             payload = exc.args[0] if exc.args else None
-            return JSONResponse(
-                status_code=500,
-                content={
-                    "detail": "Supabase RPC/APIError",
-                    "payload": payload,
-                },
-            )
+            return JSONResponse(status_code=500, content={"detail": "Supabase RPC/APIError", "payload": payload})
         except Exception:
-            return JSONResponse(
-                status_code=500,
-                content={"detail": "Supabase RPC/APIError", "payload": str(exc)},
-            )
+            return JSONResponse(status_code=500, content={"detail": "Supabase RPC/APIError", "payload": str(exc)})
 
-    # Otherwise, generic
-    return JSONResponse(
-        status_code=500,
-        content={"detail": "Internal Server Error", "error_type": type(exc).__name__},
-    )
+    return JSONResponse(status_code=500, content={"detail": "Internal Server Error", "error_type": type(exc).__name__})
 
 
 @app.get("/")
@@ -107,6 +82,7 @@ def request_access(
     buyer_id = user_resp.data[0]["user_id"]
 
     try:
+        # ✅ FIX: Your DB expects p_ttl_seconds too.
         rpc_resp = supabase.rpc(
             "nexus_request_access",
             {
@@ -114,6 +90,7 @@ def request_access(
                 "p_seller_id": request.seller_id,
                 "p_cost": COST,
                 "p_idempotency_key": x_idempotency_key,
+                "p_ttl_seconds": TOKEN_TTL_SECONDS,
             },
         ).execute()
     except APIError as e:
@@ -146,11 +123,7 @@ def verify_token(token: str, x_seller_api_key: str = Header(None)):
     try:
         rpc_resp = supabase.rpc(
             "nexus_settle_token",
-            {
-                "p_token": token,
-                "p_seller_id": seller_id,
-                "p_cost": COST,
-            },
+            {"p_token": token, "p_seller_id": seller_id, "p_cost": COST},
         ).execute()
     except APIError as e:
         _raise_clean_apierror(e)
