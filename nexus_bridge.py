@@ -1,20 +1,19 @@
 import hashlib
-import uuid
 import traceback
 from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from nexus_db import supabase
 
+# This import is important so we can detect Supabase/PostgREST errors cleanly.
+from postgrest.exceptions import APIError
+
 app = FastAPI(title="Nexus Protocol Bridge")
 
 COST = 10
 
-# Map seller API keys -> seller_id (DB user_id)
-# Keep it simple for now. Later we move this into DB table.
 SELLER_KEY_MAP = {
     "SELLER_KEY_1": "seller_01",
-    # add more later
 }
 
 
@@ -22,11 +21,62 @@ class BuyRequest(BaseModel):
     seller_id: str
 
 
+def _raise_clean_apierror(e: APIError):
+    """
+    Convert Supabase/PostgREST APIError into a readable HTTP response.
+    This is safe: it doesn't expose your keys, just the DB/RPC error message.
+    """
+    # e.args[0] is often a dict like {"message": "...", "code": "...", ...}
+    payload = None
+    try:
+        if e.args and isinstance(e.args[0], dict):
+            payload = e.args[0]
+    except Exception:
+        payload = None
+
+    if payload:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "supabase_error": True,
+                "message": payload.get("message"),
+                "code": payload.get("code"),
+                "details": payload.get("details"),
+                "hint": payload.get("hint"),
+            },
+        )
+    else:
+        raise HTTPException(
+            status_code=500,
+            detail={"supabase_error": True, "message": str(e)},
+        )
+
+
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):
-    # Print full stack trace to Render logs so we can debug production issues
+    # Print full stack trace to Render logs
     print("🔥 UNHANDLED EXCEPTION:", repr(exc), flush=True)
     traceback.print_exc()
+
+    # If it's Supabase/PostgREST, return a readable error to the client too
+    if isinstance(exc, APIError):
+        # We intentionally return the message so you can debug fast
+        try:
+            payload = exc.args[0] if exc.args else None
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "detail": "Supabase RPC/APIError",
+                    "payload": payload,
+                },
+            )
+        except Exception:
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "Supabase RPC/APIError", "payload": str(exc)},
+            )
+
+    # Otherwise, generic
     return JSONResponse(
         status_code=500,
         content={"detail": "Internal Server Error", "error_type": type(exc).__name__},
@@ -44,11 +94,6 @@ def request_access(
     x_api_key: str = Header(None),
     x_idempotency_key: str = Header(None),
 ):
-    """
-    Buyer -> Bridge:
-    - Authenticate buyer (API key hash -> users table)
-    - Call DB RPC to lock funds + mint token (idempotent)
-    """
     if not x_api_key:
         raise HTTPException(status_code=400, detail="Missing API Key header")
     if not x_idempotency_key:
@@ -61,23 +106,22 @@ def request_access(
 
     buyer_id = user_resp.data[0]["user_id"]
 
-    # Your DB has two overloads. We use the idempotency version.
-    # NOTE: We don't pass TTL here because your function signature doesn't support it (yet).
-    rpc_resp = supabase.rpc(
-        "nexus_request_access",
-        {
-            "p_buyer_id": buyer_id,
-            "p_seller_id": request.seller_id,
-            "p_cost": COST,
-            "p_idempotency_key": x_idempotency_key,
-        },
-    ).execute()
+    try:
+        rpc_resp = supabase.rpc(
+            "nexus_request_access",
+            {
+                "p_buyer_id": buyer_id,
+                "p_seller_id": request.seller_id,
+                "p_cost": COST,
+                "p_idempotency_key": x_idempotency_key,
+            },
+        ).execute()
+    except APIError as e:
+        _raise_clean_apierror(e)
 
-    # supabase-py sometimes returns dict or list depending on function definition
     if rpc_resp.data is None:
         raise HTTPException(status_code=500, detail="RPC returned no data")
 
-    # Normalize response
     if isinstance(rpc_resp.data, dict):
         token = rpc_resp.data.get("auth_token") or rpc_resp.data.get("token")
     else:
@@ -92,11 +136,6 @@ def request_access(
 
 @app.get("/verify/{token}")
 def verify_token(token: str, x_seller_api_key: str = Header(None)):
-    """
-    Seller -> Bridge:
-    - Authenticate seller via seller api key (maps to seller_id)
-    - Call DB RPC to settle token (burn token, move escrow->seller, ledger)
-    """
     if not x_seller_api_key:
         raise HTTPException(status_code=401, detail="Missing Seller API Key")
 
@@ -104,14 +143,17 @@ def verify_token(token: str, x_seller_api_key: str = Header(None)):
     if not seller_id:
         raise HTTPException(status_code=403, detail="Invalid Seller API Key")
 
-    rpc_resp = supabase.rpc(
-        "nexus_settle_token",
-        {
-            "p_token": token,
-            "p_seller_id": seller_id,
-            "p_cost": COST,
-        },
-    ).execute()
+    try:
+        rpc_resp = supabase.rpc(
+            "nexus_settle_token",
+            {
+                "p_token": token,
+                "p_seller_id": seller_id,
+                "p_cost": COST,
+            },
+        ).execute()
+    except APIError as e:
+        _raise_clean_apierror(e)
 
     if rpc_resp.data is None:
         return {"valid": False, "error": "UNKNOWN"}
@@ -132,28 +174,21 @@ def verify_token(token: str, x_seller_api_key: str = Header(None)):
 
 @app.post("/sweep_expired")
 def sweep_expired(x_admin_key: str = Header(None)):
-    """
-    Admin -> Bridge:
-    - Call DB RPC to sweep expired tokens and refund escrow
-    Your current DB function signature is:
-      nexus_sweep_expired_tokens(p_limit integer, p_cost integer [, p_triggered_by text])
-    So we implement exactly that.
-    """
-    # If you already have an ADMIN_KEY system, keep it here.
-    # If not, we still enforce "must send something" so the endpoint isn't open.
     if not x_admin_key:
         raise HTTPException(status_code=401, detail="Missing Admin Key")
 
-    rpc_resp = supabase.rpc(
-        "nexus_sweep_expired_tokens",
-        {
-            "p_limit": 5000,
-            "p_cost": COST,
-            "p_triggered_by": "bridge_admin",
-        },
-    ).execute()
+    try:
+        rpc_resp = supabase.rpc(
+            "nexus_sweep_expired_tokens",
+            {
+                "p_limit": 5000,
+                "p_cost": COST,
+                "p_triggered_by": "bridge_admin",
+            },
+        ).execute()
+    except APIError as e:
+        _raise_clean_apierror(e)
 
-    # normalize swept count
     swept = 0
     if rpc_resp.data is None:
         swept = 0
