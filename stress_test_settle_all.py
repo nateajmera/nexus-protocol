@@ -14,11 +14,11 @@ VERIFY_URL = f"{BRIDGE_BASE}/verify"
 BUYER_API_KEY = "TEST_KEY_1"
 SELLER_API_KEY = "SELLER_KEY_1"
 
-CONCURRENCY = 10
-NUM_REQUESTS = 300
+CONCURRENCY = 50
+NUM_REQUESTS = 50
 VERIFY_ATTEMPTS_PER_TOKEN = 2
 
-TIMEOUT = 30  # give Render a bit more breathing room
+TIMEOUT = 60  # give Render a bit more breathing room
 
 
 
