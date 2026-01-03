@@ -63,20 +63,26 @@ def request_access(request: BuyRequest, x_api_key: str = Header(None), x_idempot
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"RPC failure: {e}")
 
-    # rpc_resp.data should contain token
-    if not rpc_resp.data:
-        raise HTTPException(status_code=500, detail="RPC returned no data")
+    # rpc_resp.data can be:
+    # - a raw string token (your case)
+    # - a list like [{"token": "..."}] or [{"auth_token": "..."}]
+    # - a dict like {"token": "..."}
+    d = rpc_resp.data
 
-    # Depending on how your RPC returns values, adjust:
-    # common: rpc_resp.data = [{"token":"..."}]
     token = None
-    if isinstance(rpc_resp.data, list) and len(rpc_resp.data) > 0:
-        token = rpc_resp.data[0].get("token") or rpc_resp.data[0].get("auth_token")
-    elif isinstance(rpc_resp.data, dict):
-        token = rpc_resp.data.get("token") or rpc_resp.data.get("auth_token")
+    if isinstance(d, str):
+        token = d
+    elif isinstance(d, list) and len(d) > 0:
+        first = d[0]
+        if isinstance(first, str):
+            token = first
+        elif isinstance(first, dict):
+            token = first.get("token") or first.get("auth_token") or first.get("nexus_request_access")
+    elif isinstance(d, dict):
+        token = d.get("token") or d.get("auth_token") or d.get("nexus_request_access")
 
     if not token:
-        raise HTTPException(status_code=500, detail={"rpc_data": rpc_resp.data})
+        raise HTTPException(status_code=500, detail={"rpc_data": d})
 
     print(f"BRIDGE: Locked {COST} from {buyer_id} for {request.seller_id} ttl={request.ttl_seconds}", flush=True)
     return {"auth_token": token}
