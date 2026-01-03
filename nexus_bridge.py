@@ -5,15 +5,17 @@ from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException, Header, Request
 from pydantic import BaseModel
 from nexus_db import supabase
+from pydantic import BaseModel, Field
 
 app = FastAPI(title="Nexus Protocol Bridge")
 
 COST = 10
 DEFAULT_TTL_SECONDS = 600
 
-
 class BuyRequest(BaseModel):
     seller_id: str
+    ttl_seconds: int = Field(default=600, ge=5, le=3600)  # allow 5s–1h for testing
+
 
 
 def now_utc_iso() -> str:
@@ -30,72 +32,54 @@ def health_check():
 
 
 @app.post("/request_access")
-def request_access(
-    request: BuyRequest,
-    http_req: Request,
-    x_api_key: str = Header(None),
-    x_idempotency_key: str = Header(None),
-):
-    req_id = str(uuid.uuid4())[:8]
+def request_access(request: BuyRequest, x_api_key: str = Header(None), x_idempotency_key: str = Header(None)):
+    if not x_api_key:
+        raise HTTPException(status_code=400, detail="Missing API Key header")
+
+    if not x_idempotency_key:
+        # For safety. Your stress tests rely on idempotency.
+        raise HTTPException(status_code=400, detail="Missing Idempotency Key header")
+
+    hashed_key = hashlib.sha256(x_api_key.encode()).hexdigest()
+    user_resp = supabase.table("users").select("*").eq("api_key_hash", hashed_key).execute()
+
+    if not user_resp.data:
+        raise HTTPException(status_code=401, detail="Invalid API Key")
+
+    user = user_resp.data[0]
+    buyer_id = user["user_id"]
+
+    # Call the DB RPC that mints tokens safely (this assumes you have it)
+    # IMPORTANT: this passes ttl_seconds so expires_at is correct.
     try:
-        if not x_api_key:
-            raise HTTPException(status_code=400, detail="Missing API Key header")
-        if not request.seller_id:
-            raise HTTPException(status_code=400, detail="Missing seller_id")
-
-        hashed_key = hashlib.sha256(x_api_key.encode()).hexdigest()
-
-        user_resp = supabase.table("users").select("*").eq("api_key_hash", hashed_key).execute()
-        if not user_resp.data:
-            raise HTTPException(status_code=401, detail="Invalid API Key")
-
-        buyer = user_resp.data[0]
-        buyer_id = buyer["user_id"]
-
-        # Ensure seller exists
-        seller_resp = supabase.table("users").select("user_id").eq("user_id", request.seller_id).execute()
-        if not seller_resp.data:
-            raise HTTPException(status_code=404, detail="Unknown seller_id")
-
-        balance = int(buyer.get("balance") or 0)
-        escrow = int(buyer.get("escrow_balance") or 0)
-        if balance < COST:
-            raise HTTPException(status_code=402, detail="Insufficient Balance")
-
-        # Lock funds
-        supabase.table("users").update({
-            "balance": balance - COST,
-            "escrow_balance": escrow + COST
-        }).eq("user_id", buyer_id).execute()
-
-        # Mint token row
-        token = str(uuid.uuid4())
-        ins = supabase.table("tokens").insert({
-            "token": token,
-            "user_id": buyer_id,
-            "seller_id": request.seller_id,
-        }).execute()
-
-        if not ins.data:
-            # Roll back funds lock (best effort)
-            supabase.table("users").update({
-                "balance": balance,
-                "escrow_balance": escrow
-            }).eq("user_id", buyer_id).execute()
-            raise HTTPException(status_code=500, detail="Token insert failed. Funds rollback attempted.")
-
-        print(
-            f"[{now_utc_iso()}] req_id={req_id} REQUEST_ACCESS ok buyer={buyer_id} seller={request.seller_id} token={token[:8]}",
-            flush=True
-        )
-        return {"auth_token": token}
-
-    except HTTPException as e:
-        print(f"[{now_utc_iso()}] req_id={req_id} REQUEST_ACCESS http_error={e.status_code} detail={e.detail}", flush=True)
-        raise
+        rpc_args = {
+            "p_buyer_id": buyer_id,
+            "p_seller_id": request.seller_id,
+            "p_cost": COST,
+            "p_idempotency_key": x_idempotency_key,
+            "p_ttl_seconds": request.ttl_seconds,
+        }
+        rpc_resp = supabase.rpc("nexus_request_access", rpc_args).execute()
     except Exception as e:
-        print(f"[{now_utc_iso()}] req_id={req_id} REQUEST_ACCESS crash={type(e).__name__} msg={str(e)}", flush=True)
-        raise HTTPException(status_code=500, detail={"error_type": type(e).__name__, "message": str(e)})
+        raise HTTPException(status_code=500, detail=f"RPC failure: {e}")
+
+    # rpc_resp.data should contain token
+    if not rpc_resp.data:
+        raise HTTPException(status_code=500, detail="RPC returned no data")
+
+    # Depending on how your RPC returns values, adjust:
+    # common: rpc_resp.data = [{"token":"..."}]
+    token = None
+    if isinstance(rpc_resp.data, list) and len(rpc_resp.data) > 0:
+        token = rpc_resp.data[0].get("token") or rpc_resp.data[0].get("auth_token")
+    elif isinstance(rpc_resp.data, dict):
+        token = rpc_resp.data.get("token") or rpc_resp.data.get("auth_token")
+
+    if not token:
+        raise HTTPException(status_code=500, detail={"rpc_data": rpc_resp.data})
+
+    print(f"BRIDGE: Locked {COST} from {buyer_id} for {request.seller_id} ttl={request.ttl_seconds}", flush=True)
+    return {"auth_token": token}
 
 
 @app.get("/verify/{token}")
@@ -162,12 +146,6 @@ def sweep_expired(
     x_admin_key: str = Header(None),
     x_triggered_by: str = Header(None),
 ):
-    """
-    Calls the DB-side RPC nexus_sweep_expired_tokens to:
-    - find expired tokens
-    - burn them
-    - refund escrow
-    """
     req_id = str(uuid.uuid4())[:8]
     try:
         expected = admin_key_value()
@@ -180,19 +158,29 @@ def sweep_expired(
 
         triggered_by = x_triggered_by or "manual"
 
-        # Prefer the newer RPC signature if it exists
-        # Some projects have: (p_limit, p_cost, p_triggered_by)
-        # Others have:        (p_limit, p_cost)
-        # We attempt 3-arg first, then fall back.
+        def extract_int(d):
+            # Supabase can return:
+            # - int
+            # - list like [{"nexus_sweep_expired_tokens": 12}]
+            # - list like [{"swept": 12}]
+            # - dict like {"swept": 12}
+            if d is None:
+                return 0
+            if isinstance(d, int):
+                return d
+            if isinstance(d, dict):
+                for k in ("swept", "nexus_sweep_expired_tokens"):
+                    if k in d and d[k] is not None:
+                        return int(d[k])
+                return 0
+            if isinstance(d, list) and len(d) > 0:
+                return extract_int(d[0])
+            return 0
 
-        payload_3 = {"p_limit": 500, "p_cost": COST, "p_triggered_by": triggered_by}
-        try:
-            resp = supabase.rpc("nexus_sweep_expired_tokens", payload_3).execute()
-            swept = int(resp.data or 0)
-        except Exception:
-            payload_2 = {"p_limit": 500, "p_cost": COST}
-            resp = supabase.rpc("nexus_sweep_expired_tokens", payload_2).execute()
-            swept = int(resp.data or 0)
+        # Call canonical 3-arg signature (we just standardized this in DB)
+        payload = {"p_limit": 500, "p_cost": COST, "p_triggered_by": triggered_by}
+        resp = supabase.rpc("nexus_sweep_expired_tokens", payload).execute()
+        swept = extract_int(resp.data)
 
         print(f"[{now_utc_iso()}] req_id={req_id} SWEEP ok swept={swept} triggered_by={triggered_by}", flush=True)
         return {"status": "ok", "swept": swept}
