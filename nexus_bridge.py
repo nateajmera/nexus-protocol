@@ -90,61 +90,34 @@ def request_access(request: BuyRequest, x_api_key: str = Header(None), x_idempot
 
 @app.get("/verify/{token}")
 def verify_token(token: str, x_seller_api_key: str = Header(None)):
-    req_id = str(uuid.uuid4())[:8]
+    if not x_seller_api_key:
+        raise HTTPException(status_code=401, detail="Missing x-seller-api-key")
+
+    # MVP seller auth mapping
+    if x_seller_api_key == "SELLER_KEY_1":
+        caller_seller_id = "seller_01"
+    else:
+        raise HTTPException(status_code=403, detail="Invalid seller API key")
+
     try:
-        if not x_seller_api_key:
-            raise HTTPException(status_code=401, detail="Missing x-seller-api-key")
-
-        # Find token
-        token_resp = supabase.table("tokens").select("*").eq("token", token).limit(1).execute()
-        if not token_resp.data:
-            return {"valid": False, "error": "ALREADY_USED"}
-
-        t = token_resp.data[0]
-        buyer_id = t["user_id"]
-        seller_id = t["seller_id"]
-
-        # MVP seller auth mapping
-        if x_seller_api_key == "SELLER_KEY_1":
-            caller_seller_id = "seller_01"
-        else:
-            raise HTTPException(status_code=403, detail="Invalid seller API key")
-
-        if caller_seller_id != seller_id:
-            return {"valid": False, "error": "SELLER_MISMATCH"}
-
-        # Settle escrow + seller earned + rep
-        buyer_resp = supabase.table("users").select("escrow_balance").eq("user_id", buyer_id).execute()
-        buyer_escrow = int((buyer_resp.data[0].get("escrow_balance") if buyer_resp.data else 0) or 0)
-        supabase.table("users").update({
-            "escrow_balance": max(0, buyer_escrow - COST)
-        }).eq("user_id", buyer_id).execute()
-
-        seller_resp = supabase.table("users").select("total_earned, reputation").eq("user_id", seller_id).execute()
-        earned = int((seller_resp.data[0].get("total_earned") if seller_resp.data else 0) or 0)
-        rep = int((seller_resp.data[0].get("reputation") if seller_resp.data else 0) or 0)
-        supabase.table("users").update({
-            "total_earned": earned + COST,
-            "reputation": rep + 1
-        }).eq("user_id", seller_id).execute()
-
-        supabase.table("transactions").insert({
-            "buyer_id": buyer_id,
-            "seller_id": seller_id,
-            "amount": COST,
-            "token": token
-        }).execute()
-
-        supabase.table("tokens").delete().eq("token", token).execute()
-
-        print(f"[{now_utc_iso()}] req_id={req_id} VERIFY ok token={token[:8]} buyer={buyer_id} seller={seller_id}", flush=True)
-        return {"valid": True, "buyer_id": buyer_id}
-
-    except HTTPException:
-        raise
+        rpc_args = {
+            "p_token": token,
+            "p_caller_seller_id": caller_seller_id,
+            "p_cost": COST,
+        }
+        rpc_resp = supabase.rpc("nexus_verify_and_settle", rpc_args).execute()
     except Exception as e:
-        print(f"[{now_utc_iso()}] req_id={req_id} VERIFY crash={type(e).__name__} msg={str(e)}", flush=True)
         raise HTTPException(status_code=500, detail={"error_type": type(e).__name__, "message": str(e)})
+
+    if not rpc_resp.data or len(rpc_resp.data) == 0:
+        raise HTTPException(status_code=500, detail="RPC returned no data")
+
+    row = rpc_resp.data[0]
+    return {
+        "valid": bool(row.get("valid")),
+        "buyer_id": row.get("buyer_id"),
+        "error": row.get("error"),
+    }
 
 
 @app.post("/sweep_expired")
