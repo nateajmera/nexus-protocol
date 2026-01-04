@@ -6,6 +6,7 @@ import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+import os
 
 BRIDGE_BASE = "https://nexus-protocol.onrender.com"
 REQUEST_ACCESS_URL = f"{BRIDGE_BASE}/request_access"
@@ -63,10 +64,14 @@ def verify_token(token: str):
 
 
 def sweep_once():
-    # Your bridge currently accepts ANY x-admin-key (it only checks presence).
-    headers = {"x-admin-key": "local_test"}
+    admin_key = os.environ.get("ADMIN_KEY")
+    if not admin_key:
+        raise RuntimeError("ADMIN_KEY not set in environment")
+
+    headers = {"x-admin-key": admin_key}
     r = SESSION.post(SWEEP_URL, headers=headers, timeout=TIMEOUT)
     return r.status_code, r.text
+
 
 
 def main():
