@@ -16,6 +16,35 @@ class BuyRequest(BaseModel):
     seller_id: str
     ttl_seconds: int = Field(default=600, ge=5, le=3600)  # allow 5s–1h for testing
 
+def extract_token(rpc_data):
+    """
+    Supabase RPC responses can come back as:
+      - "uuid-string"
+      - {"token": "..."} or {"auth_token": "..."}
+      - [{"token": "..."}]
+    Accept all of them.
+    """
+    if rpc_data is None:
+        return None
+
+    # Case 1: plain string token
+    if isinstance(rpc_data, str):
+        return rpc_data
+
+    # Case 2: dict
+    if isinstance(rpc_data, dict):
+        return rpc_data.get("token") or rpc_data.get("auth_token")
+
+    # Case 3: list
+    if isinstance(rpc_data, list) and len(rpc_data) > 0:
+        first = rpc_data[0]
+        if isinstance(first, str):
+            return first
+        if isinstance(first, dict):
+            return first.get("token") or first.get("auth_token")
+
+    return None
+
 
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -61,15 +90,7 @@ def request_access(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"RPC failure: {e}")
 
-    if not rpc_resp.data:
-        raise HTTPException(status_code=500, detail="RPC returned no data")
-
-    token = None
-    if isinstance(rpc_resp.data, list) and len(rpc_resp.data) > 0:
-        token = rpc_resp.data[0].get("token") or rpc_resp.data[0].get("auth_token")
-    elif isinstance(rpc_resp.data, dict):
-        token = rpc_resp.data.get("token") or rpc_resp.data.get("auth_token")
-
+    token = extract_token(rpc_resp.data)
     if not token:
         raise HTTPException(status_code=500, detail={"rpc_data": rpc_resp.data})
 
