@@ -106,11 +106,27 @@ def verify_token(token: str, x_seller_api_key: str = Header(None)):
     if not x_seller_api_key:
         raise HTTPException(status_code=401, detail="Missing x-seller-api-key")
 
-    # MVP mapping (we’ll remove this in step 3)
-    if x_seller_api_key == "SELLER_KEY_1":
-        caller_seller_id = "seller_01"
-    else:
+    import hashlib
+
+    hashed = hashlib.sha256(x_seller_api_key.encode()).hexdigest()
+
+    resp = (
+        supabase
+        .table("seller_keys")
+        .select("seller_id, active")
+        .eq("api_key_hash", hashed)
+        .limit(1)
+        .execute()
+    )
+
+    if not resp.data:
         raise HTTPException(status_code=403, detail="Invalid seller API key")
+
+    row = resp.data[0]
+    if not row["active"]:
+        raise HTTPException(status_code=403, detail="Seller key disabled")
+
+    caller_seller_id = row["seller_id"]
 
     try:
         rpc_args = {
