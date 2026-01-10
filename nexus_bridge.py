@@ -55,56 +55,49 @@ def extract_token(rpc_data):
 
 def normalize_verify_result(rpc_data):
     """
-    Normalize the RPC return shape for nexus_verify_and_settle into:
-      {"valid": bool, "buyer_id": str|None, "error": str|None}
+    STRICT normalization for nexus_verify_and_settle.
 
-    We support these likely return shapes:
-      - {"valid": true, "buyer_id": "...", "error": null}
-      - [{"valid": true, ...}]
-      - true / false
-      - None / [] / {}   (treat as already used)
-      - {"buyer_id": "..."} (treat as valid if buyer_id exists)
+    Allowed return shapes:
+      1) None / [] / {}  => interpret as ALREADY_USED (idempotent "no-op")
+      2) {"valid": bool, "buyer_id": str|None, "error": str|None}
+      3) [{"valid": bool, "buyer_id": str|None, "error": str|None}]  (list with 1 dict)
+
+    Anything else => FAIL LOUDLY (raise ValueError)
     """
-    # Empty / no-op -> already used
+
+    # 1) Legitimate "no-op" shape (common for idempotent settle: token already used)
     if rpc_data is None or rpc_data == [] or rpc_data == {}:
         return {"valid": False, "buyer_id": None, "error": "ALREADY_USED"}
 
-    # Boolean return
-    if isinstance(rpc_data, bool):
-        return {"valid": rpc_data, "buyer_id": None, "error": None if rpc_data else "ALREADY_USED"}
-
-    # Dict return
+    # 2) Dict shape
     if isinstance(rpc_data, dict):
-        if "valid" in rpc_data:
-            return {
-                "valid": bool(rpc_data.get("valid")),
-                "buyer_id": rpc_data.get("buyer_id"),
-                "error": rpc_data.get("error"),
-            }
+        if "valid" not in rpc_data:
+            raise ValueError(f"Unexpected RPC dict (missing 'valid'): {rpc_data}")
 
-        # Some functions just return buyer_id (or something) on success
-        if rpc_data.get("buyer_id"):
-            return {"valid": True, "buyer_id": rpc_data.get("buyer_id"), "error": None}
+        return {
+            "valid": bool(rpc_data.get("valid")),
+            "buyer_id": rpc_data.get("buyer_id"),
+            "error": rpc_data.get("error"),
+        }
 
-        return {"valid": False, "buyer_id": None, "error": rpc_data.get("error") or "ALREADY_USED"}
+    # 3) List shape (expect list with a dict)
+    if isinstance(rpc_data, list):
+        if len(rpc_data) != 1 or not isinstance(rpc_data[0], dict):
+            raise ValueError(f"Unexpected RPC list shape: {rpc_data}")
 
-    # List of dicts return
-    if isinstance(rpc_data, list) and len(rpc_data) > 0:
         first = rpc_data[0]
-        if isinstance(first, dict):
-            if "valid" in first:
-                return {
-                    "valid": bool(first.get("valid")),
-                    "buyer_id": first.get("buyer_id"),
-                    "error": first.get("error"),
-                }
-            if first.get("buyer_id"):
-                return {"valid": True, "buyer_id": first.get("buyer_id"), "error": None}
-        # Unknown list shape
-        return {"valid": False, "buyer_id": None, "error": "ALREADY_USED"}
+        if "valid" not in first:
+            raise ValueError(f"Unexpected RPC list[0] dict (missing 'valid'): {first}")
 
-    # Fallback unknown type
-    return {"valid": False, "buyer_id": None, "error": "ALREADY_USED"}
+        return {
+            "valid": bool(first.get("valid")),
+            "buyer_id": first.get("buyer_id"),
+            "error": first.get("error"),
+        }
+
+    # Anything else => FAIL LOUDLY
+    raise ValueError(f"Unexpected RPC return type: {type(rpc_data).__name__} -> {rpc_data}")
+
 
 
 @app.get("/")
@@ -179,10 +172,6 @@ def verify_token(token: str, x_seller_api_key: str = Header(None)):
 
     # ✅ Atomic verify + settle via DB RPC
     try:
-        # IMPORTANT:
-        # We are *guessing* these parameter names based on your current code.
-        # After this paste, you will run the SQL query I give you next to confirm
-        # the exact argument names/types. Then we adjust this dict if needed.
         rpc_args = {
             "p_token": token,
             "p_caller_seller_id": caller_seller_id,
